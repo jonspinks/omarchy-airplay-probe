@@ -10,3 +10,6 @@ pin
 
 # Third-party reference sources (fetched locally, see README)
 ref/
+
+# Portal restore token (grants silent re-capture)
+portal-session-token

@@ -731,6 +731,74 @@ class MirrorStreamer:
         return self.stats
 
 
+class WaylandSource:
+    """Direct ext-image-copy-capture (wlcapture.py) -> libx264 -> access units.
+
+    Covers all three sharing modes without a portal: output:eDP-1 (whole screen),
+    output:AIRPLAY-1 (a Hyprland virtual output, i.e. Extend) and window:TEXT.
+    Frames arrive only when the image changes; the last frame is re-encoded every
+    250 ms of stillness so the receiver keeps getting video.
+    """
+
+    def __init__(self, target, fps, bitrate, fit_within, keyint):
+        from wlcapture import Capture
+        import av
+        self.av, self.fps, self.bitrate, self.keyint, self.fit = av, fps, bitrate, keyint, fit_within
+        self.capture = Capture(target)
+        self.label = self.capture.label
+        self.first_packet_ms = None
+        self.encoder, self.size = None, None
+        self._configure(self.capture.size)
+
+    def _configure(self, source_size):
+        scale = min(1.0, self.fit[0] / source_size[0], self.fit[1] / source_size[1])
+        size = (max(2, int(source_size[0] * scale) // 2 * 2), max(2, int(source_size[1] * scale) // 2 * 2))
+        if self.encoder is not None and size == self.size:
+            return
+        encoder = self.av.CodecContext.create("libx264", "w")
+        encoder.width, encoder.height = size
+        encoder.pix_fmt = "yuv420p"
+        encoder.time_base = Fraction(1, self.fps)
+        encoder.framerate = Fraction(self.fps, 1)
+        encoder.bit_rate = self.bitrate
+        encoder.options = {
+            "preset": "ultrafast", "tune": "zerolatency", "profile": "high", "level": "4.2",
+            "x264-params": f"keyint={self.fps * self.keyint}:min-keyint={self.fps}:bframes=0:repeat-headers=1:annexb=1",
+        }
+        if self.encoder is not None:
+            log.info("    source resized to %dx%d; encoding %dx%d", *source_size, *size)
+        self.encoder, self.size, self.source_size = encoder, size, source_size
+
+    def packets(self):
+        started, last, n = time.monotonic(), None, 0
+        while True:
+            result = self.capture.frame(timeout=0.25)
+            if result is not None:
+                last = result[1]
+            elif last is None or self.capture.stopped:
+                if self.capture.stopped:
+                    return
+                continue
+            height, width = last.shape[:2]
+            if (width, height) != self.source_size:
+                self._configure((width, height))
+            frame = self.av.VideoFrame.from_ndarray(last, format="bgra").reformat(
+                width=self.size[0], height=self.size[1], format="yuv420p")
+            frame.pts = n
+            n += 1
+            for packet in self.encoder.encode(frame):
+                if self.first_packet_ms is None:
+                    self.first_packet_ms = round((time.monotonic() - started) * 1000)
+                    log.info("    first encoded frame after %d ms (%dx%d from %s)", self.first_packet_ms, *self.size, self.label)
+                yield bytes(packet)
+
+    def stop(self):
+        try:
+            self.capture.conn.sock.close()
+        except OSError:
+            pass
+
+
 def monitor_size(name):
     out = subprocess.run(["gpu-screen-recorder", "--list-capture-options"], capture_output=True,
                          text=True, timeout=10).stdout
@@ -761,7 +829,14 @@ class ScreenSource:
         box_w, box_h = fit_within
         scale = min(1.0, box_w / source_size[0], box_h / source_size[1])
         self.size = (int(source_size[0] * scale) // 2 * 2, int(source_size[1] * scale) // 2 * 2)
-        self.cmd = ["gpu-screen-recorder", "-w", monitor, "-c", "h264", "-k", "h264",
+        if monitor == "portal":
+            # xdg-desktop-portal: pick a window or any output, including Hyprland virtual
+            # outputs that KMS capture cannot see. The token skips the picker next time.
+            target = ["-w", "portal", "-restore-portal-session", "yes",
+                      "-portal-session-token-filepath", str(HERE / "portal-session-token")]
+        else:
+            target = ["-w", monitor]
+        self.cmd = ["gpu-screen-recorder", *target, "-c", "h264", "-k", "h264",
                     "-f", str(fps), "-fm", "cfr", "-cursor", "yes", "-keyint", str(keyint),
                     "-tune", "performance", "-encoder", encoder, "-fallback-cpu-encoding", "yes",
                     *(["-low-power", "yes"] if encoder == "gpu" else []),
@@ -1077,6 +1152,22 @@ def run(args):
                                               keyint=args.keyint, rate_mode=args.rate_mode, quality=args.quality)
                         width, height = source.size
                         label = f"screen {args.monitor} (fit {fit[0]}x{fit[1]})"
+                    elif args.source == "wayland":
+                        display = (info.get("displays") or [{}])[0]
+                        fit = (display.get("widthPixels") or 1920, display.get("heightPixels") or 1080)
+                        source = WaylandSource(args.target, args.fps, args.bitrate, fit, args.keyint)
+                        width, height = source.size
+                        label = f"{source.label} (fit {fit[0]}x{fit[1]})"
+                    elif args.source == "portal":
+                        display = (info.get("displays") or [{}])[0]
+                        fit = (display.get("widthPixels") or 1920, display.get("heightPixels") or 1080)
+                        # Size is unknown until the first frame decodes (a window can be any shape).
+                        source = ScreenSource("portal", args.fps, args.bitrate, args.capture_encoder,
+                                              run_dir / "gpu-screen-recorder.log", fit, fit,
+                                              keyint=args.keyint, rate_mode=args.rate_mode, quality=args.quality)
+                        width, height = source.size
+                        log.info("    choose a window or output in the picker on the laptop screen")
+                        label = f"portal selection (fit {fit[0]}x{fit[1]})"
                     else:
                         width, height = (int(v) for v in args.size.lower().split("x"))
                         label = "test pattern"
@@ -1135,7 +1226,9 @@ def main():
     parser.add_argument("--no-audio-retry", action="store_true")
     parser.add_argument("--stream-seconds", type=float, default=0, help="stage 2: stream a test pattern")
     parser.add_argument("--video-cipher", choices=["chacha", "aesctr", "none"], default="chacha")
-    parser.add_argument("--source", choices=["pattern", "screen"], default="pattern")
+    parser.add_argument("--source", choices=["pattern", "screen", "portal", "wayland"], default="pattern")
+    parser.add_argument("--target", default="output:eDP-1",
+                        help="for --source wayland: output:NAME (e.g. AIRPLAY-1 for Extend) or window:TEXT")
     parser.add_argument("--monitor", default="eDP-1", help="monitor for --source screen")
     parser.add_argument("--keyint", type=int, default=5, help="seconds between keyframes for --source screen")
     parser.add_argument("--rate-mode", choices=["cbr", "vbr", "qp"], help="default: cbr for cpu, qp for gpu")
