@@ -752,7 +752,8 @@ class ScreenSource:
     own encoder.
     """
 
-    def __init__(self, monitor, fps, bitrate, encoder, log_path, fit_within, source_size, keyint=1):
+    def __init__(self, monitor, fps, bitrate, encoder, log_path, fit_within, source_size, keyint=1,
+                 rate_mode=None, quality="high"):
         # The receiver's H.264 decoder has a level ceiling (the Frame advertises
         # avc1.64002a = High@4.2, max 8192 macroblocks). A 1920x1200 panel is 9000
         # macroblocks, forcing level 5.0, which the Frame accepts and renders black.
@@ -763,13 +764,25 @@ class ScreenSource:
         self.cmd = ["gpu-screen-recorder", "-w", monitor, "-c", "h264", "-k", "h264",
                     "-f", str(fps), "-fm", "cfr", "-cursor", "yes", "-keyint", str(keyint),
                     "-tune", "performance", "-encoder", encoder, "-fallback-cpu-encoding", "yes",
-                    "-bm", "cbr", "-q", str(bitrate // 1000), "-s", f"{box_w}x{box_h}",
+                    *(["-low-power", "yes"] if encoder == "gpu" else []),
+                    # VA-API pads every CBR/VBR frame to a constant size (16 KiB at 60 fps even
+                    # for an idle desktop), saturating Wi-Fi; constant quality sends data only
+                    # when the picture changes. x264 CBR undershoots naturally, so keep it there.
+                    *(["-bm", "cbr", "-q", str(bitrate // 1000)] if (rate_mode or ("cbr" if encoder == "cpu" else "qp")) == "cbr"
+                      else ["-bm", rate_mode or "qp", "-q", quality]),
+                    "-s", f"{box_w}x{box_h}",
                     # flags=-global_header: otherwise SPS/PPS live in container extradata,
                     #   which the raw h264 muxer drops.
                     # tune=zerolatency: gpu-screen-recorder's default x264 setup uses 21
                     #   frame threads plus a 10-frame lookahead, holding ~1 s of frames;
                     #   first output drops from ~1300 ms to ~250 ms without it.
-                    "-ffmpeg-video-opts", "flags=-global_header;level=4.2;tune=zerolatency",
+                    # tune=zerolatency is x264-only; VA-API has no lookahead to disable.
+                    # sei=0 (VA-API): drops pic_timing SEI and the SPS HRD model, which
+                    #   otherwise invites the TV to buffer before display.
+                    # async_depth=1 (VA-API): measured with latency.py, the default queue
+                    #   holds ~2 frames: cursor latency 81 ms -> 48 ms (x264 zerolatency: 39 ms).
+                    "-ffmpeg-video-opts", "flags=-global_header;level=4.2" +
+                    (";tune=zerolatency" if encoder == "cpu" else ";sei=0;async_depth=1"),
                     "-o", "/dev/stdout"]
         self.log_file = open(log_path, "wb")
         self.proc = None
@@ -1061,7 +1074,7 @@ def run(args):
                         fit = (display.get("widthPixels") or 1920, display.get("heightPixels") or 1080)
                         source = ScreenSource(args.monitor, args.fps, args.bitrate, args.capture_encoder,
                                               run_dir / "gpu-screen-recorder.log", fit, monitor_size(args.monitor),
-                                              keyint=args.keyint)
+                                              keyint=args.keyint, rate_mode=args.rate_mode, quality=args.quality)
                         width, height = source.size
                         label = f"screen {args.monitor} (fit {fit[0]}x{fit[1]})"
                     else:
@@ -1125,8 +1138,11 @@ def main():
     parser.add_argument("--source", choices=["pattern", "screen"], default="pattern")
     parser.add_argument("--monitor", default="eDP-1", help="monitor for --source screen")
     parser.add_argument("--keyint", type=int, default=5, help="seconds between keyframes for --source screen")
-    parser.add_argument("--capture-encoder", choices=["gpu", "cpu"], default="cpu",
-                        help="gpu needs a working VA-API driver (intel-media-driver)")
+    parser.add_argument("--rate-mode", choices=["cbr", "vbr", "qp"], help="default: cbr for cpu, qp for gpu")
+    parser.add_argument("--quality", default="high", choices=["medium", "high", "very_high", "ultra"],
+                        help="quality preset for qp/vbr")
+    parser.add_argument("--capture-encoder", choices=["gpu", "cpu"], default="gpu",
+                        help="gpu = VA-API (needs intel-media-driver); ~12%% vs ~256%% CPU at 60 fps")
     parser.add_argument("--size", default="1920x1080")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--bitrate", type=int, default=6_000_000)
