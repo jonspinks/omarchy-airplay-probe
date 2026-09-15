@@ -731,6 +731,27 @@ class MirrorStreamer:
         return self.stats
 
 
+class VirtualOutput:
+    """A Hyprland headless output for Extend, removed again on every exit path."""
+
+    def __init__(self, name, width, height, fps):
+        self.name = name
+        existing = json.loads(subprocess.run(["hyprctl", "monitors", "all", "-j"], capture_output=True, text=True).stdout)
+        self.created = not any(m["name"] == name for m in existing)
+        if self.created:
+            subprocess.run(["hyprctl", "output", "create", "headless", name], capture_output=True, check=True)
+            log.info("    created virtual output %s", name)
+        subprocess.run(["hyprctl", "eval", f'hl.monitor({{ output = "{name}", mode = "{width}x{height}@{fps}", '
+                        f'position = "auto-right", scale = 1 }})'], capture_output=True, check=True)
+        time.sleep(0.5)
+
+    def remove(self):
+        if self.created:
+            subprocess.run(["hyprctl", "output", "remove", self.name], capture_output=True)
+            log.info("    removed virtual output %s", self.name)
+            self.created = False
+
+
 class WaylandSource:
     """Direct ext-image-copy-capture (wlcapture.py) -> libx264 -> access units.
 
@@ -982,6 +1003,7 @@ def run(args):
 
     conn = event = timing = None
     timing_sock = None
+    cleanups = []
     session_uuid = str(uuid.uuid4()).upper()
     audio_sc_id = random.getrandbits(63)
     audio_uri = f"rtsp://{host}:{AIRPLAY_PORT}/{audio_sc_id}"
@@ -1155,6 +1177,9 @@ def run(args):
                     elif args.source == "wayland":
                         display = (info.get("displays") or [{}])[0]
                         fit = (display.get("widthPixels") or 1920, display.get("heightPixels") or 1080)
+                        if args.target.startswith("output:AIRPLAY"):
+                            virtual = VirtualOutput(args.target.split(":", 1)[1], *fit, args.fps)
+                            cleanups.append(virtual.remove)
                         source = WaylandSource(args.target, args.fps, args.bitrate, fit, args.keyint)
                         width, height = source.size
                         label = f"{source.label} (fit {fit[0]}x{fit[1]})"
@@ -1190,6 +1215,11 @@ def run(args):
             steps["data_port_connect"] = "no dataPort in response"
 
     finally:
+        for cleanup in cleanups:
+            try:
+                cleanup()
+            except Exception as exc:  # never let cleanup mask the real error
+                log.info("    cleanup failed: %s", exc)
         if conn is not None and conn.cipher is not None:
             try:
                 conn.request("TEARDOWN", audio_uri, {"Session": session_uuid}, timeout=5)
@@ -1244,6 +1274,9 @@ def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+    # SIGTERM (timeout, systemd) would otherwise skip `finally`, leaving a virtual output behind.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         run(args)
     except ProbeError as exc:
