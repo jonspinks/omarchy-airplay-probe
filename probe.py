@@ -752,7 +752,7 @@ class ScreenSource:
     own encoder.
     """
 
-    def __init__(self, monitor, fps, bitrate, encoder, log_path, fit_within, source_size):
+    def __init__(self, monitor, fps, bitrate, encoder, log_path, fit_within, source_size, keyint=1):
         # The receiver's H.264 decoder has a level ceiling (the Frame advertises
         # avc1.64002a = High@4.2, max 8192 macroblocks). A 1920x1200 panel is 9000
         # macroblocks, forcing level 5.0, which the Frame accepts and renders black.
@@ -761,7 +761,7 @@ class ScreenSource:
         scale = min(1.0, box_w / source_size[0], box_h / source_size[1])
         self.size = (int(source_size[0] * scale) // 2 * 2, int(source_size[1] * scale) // 2 * 2)
         self.cmd = ["gpu-screen-recorder", "-w", monitor, "-c", "h264", "-k", "h264",
-                    "-f", str(fps), "-fm", "cfr", "-cursor", "yes", "-keyint", "1",
+                    "-f", str(fps), "-fm", "cfr", "-cursor", "yes", "-keyint", str(keyint),
                     "-tune", "performance", "-encoder", encoder, "-fallback-cpu-encoding", "yes",
                     "-bm", "cbr", "-q", str(bitrate // 1000), "-s", f"{box_w}x{box_h}",
                     # flags=-global_header: otherwise SPS/PPS live in container extradata,
@@ -1060,7 +1060,8 @@ def run(args):
                         display = (info.get("displays") or [{}])[0]
                         fit = (display.get("widthPixels") or 1920, display.get("heightPixels") or 1080)
                         source = ScreenSource(args.monitor, args.fps, args.bitrate, args.capture_encoder,
-                                              run_dir / "gpu-screen-recorder.log", fit, monitor_size(args.monitor))
+                                              run_dir / "gpu-screen-recorder.log", fit, monitor_size(args.monitor),
+                                              keyint=args.keyint)
                         width, height = source.size
                         label = f"screen {args.monitor} (fit {fit[0]}x{fit[1]})"
                     else:
@@ -1123,6 +1124,7 @@ def main():
     parser.add_argument("--video-cipher", choices=["chacha", "aesctr", "none"], default="chacha")
     parser.add_argument("--source", choices=["pattern", "screen"], default="pattern")
     parser.add_argument("--monitor", default="eDP-1", help="monitor for --source screen")
+    parser.add_argument("--keyint", type=int, default=5, help="seconds between keyframes for --source screen")
     parser.add_argument("--capture-encoder", choices=["gpu", "cpu"], default="cpu",
                         help="gpu needs a working VA-API driver (intel-media-driver)")
     parser.add_argument("--size", default="1920x1080")
