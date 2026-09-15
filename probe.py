@@ -791,29 +791,59 @@ class WaylandSource:
         self.encoder, self.size, self.source_size = encoder, size, source_size
 
     def packets(self):
-        started, last, n = time.monotonic(), None, 0
-        while True:
-            result = self.capture.frame(timeout=0.25)
-            if result is not None:
-                last = result[1]
-            elif last is None or self.capture.stopped:
-                if self.capture.stopped:
-                    return
-                continue
-            height, width = last.shape[:2]
+        # Capture runs on its own thread and always asks for the next frame straight
+        # away; the encoder takes the newest. Converting on the capture thread made
+        # every request miss the next refresh (~20 fps ceiling, see README).
+        import cv2
+        state = {"frame": None, "seq": 0}
+        ready, self._stop_capture = threading.Condition(), threading.Event()
+        self.captured = 0
+
+        def capture_loop():
+            while not self._stop_capture.is_set():
+                try:
+                    result = self.capture.frame(timeout=0.25)
+                except Exception as exc:
+                    log.info("    capture stopped: %s", exc)
+                    break
+                if result is None:
+                    if self.capture.stopped:
+                        break
+                    continue
+                with ready:
+                    state["frame"], state["seq"] = result[1], state["seq"] + 1
+                    self.captured += 1
+                    ready.notify()
+            self._stop_capture.set()
+            with ready:
+                ready.notify()
+
+        threading.Thread(target=capture_loop, daemon=True).start()
+        started, seen, n = time.monotonic(), 0, 0
+        while not self._stop_capture.is_set():
+            with ready:
+                ready.wait_for(lambda: state["seq"] != seen or self._stop_capture.is_set(), timeout=0.25)
+                frame, seen = state["frame"], state["seq"]
+            if frame is None:
+                continue  # nothing captured yet; a stale frame is re-sent every 250 ms of stillness
+            height, width = frame.shape[:2]
             if (width, height) != self.source_size:
                 self._configure((width, height))
-            frame = self.av.VideoFrame.from_ndarray(last, format="bgra").reformat(
-                width=self.size[0], height=self.size[1], format="yuv420p")
-            frame.pts = n
+            if (width, height) != self.size:
+                frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_LINEAR)
+            yuv = cv2.cvtColor(frame, cv2.COLOR_BGRA2YUV_I420)
+            video = self.av.VideoFrame.from_ndarray(yuv, format="yuv420p")
+            video.pts = n
             n += 1
-            for packet in self.encoder.encode(frame):
+            for packet in self.encoder.encode(video):
                 if self.first_packet_ms is None:
                     self.first_packet_ms = round((time.monotonic() - started) * 1000)
                     log.info("    first encoded frame after %d ms (%dx%d from %s)", self.first_packet_ms, *self.size, self.label)
                 yield bytes(packet)
 
     def stop(self):
+        if getattr(self, "_stop_capture", None):
+            self._stop_capture.set()
         try:
             self.capture.conn.sock.close()
         except OSError:
@@ -1204,6 +1234,8 @@ def run(args):
                     steps["stream"] = streamer.run(args.stream_seconds, source)
                     if source is not None:
                         steps["stream"]["first_captured_frame_ms"] = source.first_packet_ms
+                        if hasattr(source, "captured"):
+                            steps["stream"]["captured_frames"] = source.captured
                     log.info("    stream: %s", json.dumps(steps["stream"]))
                 else:
                     log.info("    connected to video data port %s; holding %ss -- watch the TV", data_port, args.hold)
