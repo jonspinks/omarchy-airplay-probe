@@ -198,6 +198,7 @@ class RtspConnection:
         self.cipher = None
         self._buf = b""
         self.lock = threading.Lock()
+        self.default_headers = {}
 
     @property
     def local_ip(self):
@@ -253,7 +254,7 @@ class RtspConnection:
     def _request(self, method, uri, headers, body, content_type, timeout, quiet):
         self.cseq += 1
         lines = [f"{method} {uri} RTSP/1.0", f"CSeq: {self.cseq}", f"User-Agent: {USER_AGENT}"]
-        for k, v in (headers or {}).items():
+        for k, v in {**self.default_headers, **(headers or {})}.items():
             lines.append(f"{k}: {v}")
         if content_type and body:
             lines.append(f"Content-Type: {content_type}")
@@ -541,6 +542,7 @@ class AudioSender(threading.Thread):
         self.host, self.data_port, self.control_port = host, data_port, control_port
         self.data_sock, self.ctrl_sock, self.mode = data_sock, ctrl_sock, mode
         self.aead = ChaCha20Poly1305(key)
+        self.tone_level = 0.3
         self.stop = threading.Event()
         self.stats = {"packets": 0, "syncs": 0, "control_packets_from_receiver": 0, "source": mode,
                       "peak_level": 0, "silent_frames": 0, "max_send_gap_ms": 0.0, "late_frames_over_20ms": 0}
@@ -560,7 +562,7 @@ class AudioSender(threading.Thread):
                 n = np.arange(t, t + ALAC_SPF)
                 phase = (n % AUDIO_RATE) / AUDIO_RATE
                 beep = (phase < 0.15).astype(np.float64)  # 150 ms beep each second
-                wave = 0.3 * np.sin(2 * np.pi * 880 * n / AUDIO_RATE) * beep
+                wave = self.tone_level * np.sin(2 * np.pi * 880 * n / AUDIO_RATE) * beep
                 stereo = np.repeat((wave * 32767).astype("<i2"), 2)
                 t += ALAC_SPF
                 yield stereo.tobytes()
@@ -1208,6 +1210,11 @@ def run(args):
         write_key = hkdf(shared, "Control-Salt", "Control-Write-Encryption-Key")
         read_key = hkdf(shared, "Control-Salt", "Control-Read-Encryption-Key")
         conn.cipher = HapCipher(write_key, read_key)
+        if args.dacp:
+            dacp_id = f"{random.getrandbits(64):016X}"
+            conn.default_headers = {"DACP-ID": dacp_id, "Active-Remote": str(random.getrandbits(32)),
+                                    "Client-Instance": dacp_id}
+            steps["dacp_headers"] = conn.default_headers
 
         # 2. Encrypted channel --------------------------------------------
         log.info("[2] Encrypted GET /info")
@@ -1343,13 +1350,38 @@ def run(args):
             with socket.create_connection((host, int(data_port)), timeout=5) as data_sock:
                 data_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 steps["data_port_connect"] = f"ok ({data_port})"
-                if audio_ports:
-                    # AirPlay volume is dB: 0 = maximum, -30 = quietest audible, -144 = mute.
-                    # Without it the Frame starts the session at 100%. Sent after the video
-                    # data connection (earlier, right after audio SETUP, it returned 500).
-                    body = f"volume: {args.volume_db:.6f}\r\n".encode()
-                    vstatus, _, _ = conn.request("SET_PARAMETER", audio_uri, {}, body, "text/parameters")
-                    steps["volume"] = {"db": args.volume_db, "status": vstatus}
+                def volume_probe():
+                    # AirPlay volume is dB: 0 = max, -30 = quietest, -144 = mute. The Frame starts
+                    # sessions at 100%; find a SET_PARAMETER form it accepts once audio flows.
+                    time.sleep(2.0)
+                    results = []
+                    try:
+                        gstatus, gheaders, gbody = conn.request("GET_PARAMETER", audio_uri, {}, b"volume\r\n", "text/parameters")
+                        results.append({"variant": "GET_PARAMETER volume", "status": gstatus,
+                                         "body": gbody.decode(errors="replace").strip()[:80]})
+                        body = f"volume: {args.volume_db:.6f}\r\n".encode()
+                        variants = [
+                            ("audio URI", audio_uri, {}),
+                            ("audio URI + Session", audio_uri, {"Session": session_uuid}),
+                            ("session URI", f"rtsp://{conn.local_ip}/{audio_sc_id}", {"Session": session_uuid}),
+                            ("video URI", f"rtsp://{host}:{AIRPLAY_PORT}/{video_sc_id}", {"Session": session_uuid}),
+                            ("bare path", "/", {"Session": session_uuid}),
+                        ]
+                        for name, uri, extra in variants:
+                            status, _, rbody = conn.request("SET_PARAMETER", uri, extra, body, "text/parameters")
+                            results.append({"variant": name, "uri": uri, "status": status})
+                            if status == 200 or args.volume_single:
+                                break
+                        time.sleep(1.0)
+                        gstatus, _, gbody = conn.request("GET_PARAMETER", audio_uri, {}, b"volume\r\n", "text/parameters")
+                        results.append({"variant": "GET_PARAMETER volume (read-back)", "status": gstatus,
+                                         "body": gbody.decode(errors="replace").strip()[:80]})
+                    except (ProbeError, OSError) as exc:
+                        results.append({"error": str(exc)})
+                    steps["volume_probe"] = {"db": args.volume_db, "dacp": bool(args.dacp), "results": results}
+                    log.info("    volume probe: %s", json.dumps(results))
+                if audio_ports and args.volume_probe:
+                    threading.Thread(target=volume_probe, daemon=True).start()
                 if args.stream_seconds > 0:
                     source = None
                     if args.source == "screen":
@@ -1391,6 +1423,7 @@ def run(args):
                         adata_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         adata_sock.bind(("0.0.0.0", args.timing_port + 2))
                         audio = AudioSender(host, audio_ports[0], audio_ports[1], adata_sock, ctrl_sock, audio_key, args.audio)
+                        audio.tone_level = args.tone_level
                         audio.start()
                         log.info("    audio started -> dataPort %d controlPort %d", *audio_ports)
                         cleanups.insert(0, lambda: (audio.stop.set(), audio.join(3), ctrl_sock.close(), adata_sock.close()))
@@ -1460,6 +1493,10 @@ def main():
     parser.add_argument("--audio", choices=["none", "tone", "system"], default="none",
                         help="tone: 880 Hz beep each second; system: default sink monitor via parec")
     parser.add_argument("--audio-latency-ms", type=int, default=300, help="receiver playout budget for audio")
+    parser.add_argument("--dacp", action="store_true", help="send DACP-ID/Active-Remote/Client-Instance on every request")
+    parser.add_argument("--volume-probe", action="store_true", help="try SET_PARAMETER volume variants once audio flows")
+    parser.add_argument("--tone-level", type=float, default=0.3, help="beep amplitude 0..1")
+    parser.add_argument("--volume-single", action="store_true", help="send only the first SET_PARAMETER variant")
     parser.add_argument("--volume-db", type=float, default=-20.0,
                         help="AirPlay volume in dB: 0 = max, -30 = quietest, -144 = mute")
     parser.add_argument("--stream-seconds", type=float, default=0, help="stage 2: stream a test pattern")
