@@ -1,0 +1,5 @@
+cryptography
+srptools
+av
+pillow
+numpy

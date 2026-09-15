@@ -1,0 +1,12 @@
+# Local environment and results
+.venv/
+__pycache__/
+runs/
+.last-run-start
+
+# Secrets: long-term pairing keys and the PIN hand-off file
+credentials.json
+pin
+
+# Third-party reference sources (fetched locally, see README)
+ref/
