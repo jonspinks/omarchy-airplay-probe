@@ -1275,8 +1275,10 @@ def run(args):
             steps["record"] = status
 
         audio_ports = None
+        globals()["AUDIO_LATENCY_SAMPLES"] = int(args.audio_latency_ms / 1000 * AUDIO_RATE)
         if args.audio != "none":
-            log.info("[3b] Audio stream SETUP (type 96, ALAC 44.1 kHz stereo, %s)", args.audio)
+            log.info("[3b] Audio stream SETUP (type 96, ALAC 44.1 kHz stereo, %s, latency %d ms = %d samples)",
+                     args.audio, args.audio_latency_ms, AUDIO_LATENCY_SAMPLES)
             audio_key = os.urandom(32)
             audio_desc = {
                 "type": 96, "streamConnectionID": audio_sc_id, "ct": 2, "spf": ALAC_SPF, "sr": AUDIO_RATE,
@@ -1452,6 +1454,7 @@ def main():
     parser.add_argument("--no-audio-retry", action="store_true")
     parser.add_argument("--audio", choices=["none", "tone", "system"], default="none",
                         help="tone: 880 Hz beep each second; system: default sink monitor via parec")
+    parser.add_argument("--audio-latency-ms", type=int, default=85, help="receiver playout budget for audio")
     parser.add_argument("--stream-seconds", type=float, default=0, help="stage 2: stream a test pattern")
     parser.add_argument("--video-cipher", choices=["chacha", "aesctr", "none"], default="chacha")
     parser.add_argument("--source", choices=["pattern", "screen", "portal", "wayland"], default="pattern")
