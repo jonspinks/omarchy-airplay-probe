@@ -542,7 +542,8 @@ class AudioSender(threading.Thread):
         self.data_sock, self.ctrl_sock, self.mode = data_sock, ctrl_sock, mode
         self.aead = ChaCha20Poly1305(key)
         self.stop = threading.Event()
-        self.stats = {"packets": 0, "syncs": 0, "control_packets_from_receiver": 0, "source": mode}
+        self.stats = {"packets": 0, "syncs": 0, "control_packets_from_receiver": 0, "source": mode,
+                      "peak_level": 0, "silent_frames": 0, "max_send_gap_ms": 0.0, "late_frames_over_20ms": 0}
 
     def _sync(self, rtp_now, first):
         packet = (bytes([0x90 if first else 0x80, 0xD4]) + (4).to_bytes(2, "big")
@@ -583,8 +584,8 @@ class AudioSender(threading.Thread):
     def run(self):
         seq, rtp, nonce = random.getrandbits(16), random.getrandbits(32), 0
         self.ctrl_sock.setblocking(False)
+        self._last_send = time.monotonic()
         started, frame_index, last_sync = time.monotonic(), 0, 0.0
-        self._sync(rtp, first=True)
         for pcm in self._frames():
             if self.stop.is_set():
                 break
@@ -592,6 +593,23 @@ class AudioSender(threading.Thread):
                 delay = started + frame_index * ALAC_SPF / AUDIO_RATE - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
+            if frame_index == 0 or time.monotonic() - self._last_send > 0.25:
+                # Anchor RTP to the network clock at the moment the first sample is sent.
+                # Anchoring at thread start made every packet late by parec's startup time
+                # (hundreds of ms against an 85 ms budget), so the TV dropped all audio.
+                # A capture stall is re-anchored the same way (0x90 = timeline reset).
+                self._sync(rtp, first=True)
+                self.stats["anchors"] = self.stats.get("anchors", 0) + 1
+                last_sync = time.monotonic()
+            level = int(np.abs(np.frombuffer(pcm, dtype="<i2")).max())
+            self.stats["peak_level"] = max(self.stats["peak_level"], level)
+            self.stats["silent_frames"] += int(level < 50)
+            send_time = time.monotonic()
+            if frame_index:
+                gap = (send_time - self._last_send) * 1000 if self._last_send else 0
+                self.stats["max_send_gap_ms"] = round(max(self.stats["max_send_gap_ms"], gap), 1)
+                self.stats["late_frames_over_20ms"] += int(gap > 20)
+            self._last_send = send_time
             header = bytes([0x80, 0x60]) + seq.to_bytes(2, "big") + rtp.to_bytes(4, "big") + (0).to_bytes(4, "big")
             sealed = self.aead.encrypt(nonce_counter(nonce), alac_uncompressed_frame(pcm), header[4:12])
             self.data_sock.sendto(header + sealed + nonce.to_bytes(8, "little"), (self.host, self.data_port))
