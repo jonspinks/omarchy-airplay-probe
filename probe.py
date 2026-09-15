@@ -1295,8 +1295,6 @@ def run(args):
             stream96 = next((st for st in (aresp.get("streams") or []) if st.get("type") == 96), {}) if isinstance(aresp, dict) else {}
             if astatus == 200 and stream96.get("dataPort"):
                 audio_ports = (int(stream96["dataPort"]), int(stream96.get("controlPort") or 0))
-                for _ in range(2):  # doubletake sends volume twice
-                    conn.request("SET_PARAMETER", audio_uri, {}, b"volume: 0.000000\r\n", "text/parameters")
 
         # 4. Video stream SETUP, no FairPlay ------------------------------
         def video_setup():
@@ -1345,6 +1343,13 @@ def run(args):
             with socket.create_connection((host, int(data_port)), timeout=5) as data_sock:
                 data_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 steps["data_port_connect"] = f"ok ({data_port})"
+                if audio_ports:
+                    # AirPlay volume is dB: 0 = maximum, -30 = quietest audible, -144 = mute.
+                    # Without it the Frame starts the session at 100%. Sent after the video
+                    # data connection (earlier, right after audio SETUP, it returned 500).
+                    body = f"volume: {args.volume_db:.6f}\r\n".encode()
+                    vstatus, _, _ = conn.request("SET_PARAMETER", audio_uri, {}, body, "text/parameters")
+                    steps["volume"] = {"db": args.volume_db, "status": vstatus}
                 if args.stream_seconds > 0:
                     source = None
                     if args.source == "screen":
@@ -1454,7 +1459,9 @@ def main():
     parser.add_argument("--no-audio-retry", action="store_true")
     parser.add_argument("--audio", choices=["none", "tone", "system"], default="none",
                         help="tone: 880 Hz beep each second; system: default sink monitor via parec")
-    parser.add_argument("--audio-latency-ms", type=int, default=85, help="receiver playout budget for audio")
+    parser.add_argument("--audio-latency-ms", type=int, default=300, help="receiver playout budget for audio")
+    parser.add_argument("--volume-db", type=float, default=-20.0,
+                        help="AirPlay volume in dB: 0 = max, -30 = quietest, -144 = mute")
     parser.add_argument("--stream-seconds", type=float, default=0, help="stage 2: stream a test pattern")
     parser.add_argument("--video-cipher", choices=["chacha", "aesctr", "none"], default="chacha")
     parser.add_argument("--source", choices=["pattern", "screen", "portal", "wayland"], default="pattern")
