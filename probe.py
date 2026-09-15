@@ -17,6 +17,10 @@ encodes a generated test pattern with libx264 and streams it over the
 mirroring data channel. If the pattern appears on the TV, the receiver
 decrypted frames with no FairPlay involved.
 
+Stage 3 (--source screen) streams the real desktop instead: gpu-screen-recorder
+captures a monitor through its KMS helper (cursor included, no portal dialog)
+and pipes H.264 in MPEG-TS, which is demuxed and forwarded frame by frame.
+
 Protocol details were cross-checked against two readable references kept in
 ref/: pyatv (MIT) for HAP pairing, and doubletake (LGPL-3.0) for the mirroring
 SETUP sequence. This file is an independent implementation.
@@ -655,57 +659,152 @@ class MirrorStreamer:
                 return
             self.stats["bytes_from_receiver"] += len(chunk)
 
-    def run(self, seconds):
-        pattern = TestPattern(self.width, self.height)
+    def _forward(self, annexb):
+        """Send one encoded access unit: codec packet on parameter change, then the frame."""
+        nals = split_annexb(annexb)
+        sps = next((x for x in nals if x[0] & 0x1F == 7), None)
+        pps = next((x for x in nals if x[0] & 0x1F == 8), None)
+        if sps and pps and (sps, pps) != self._sent_params:
+            self.send_codec(sps, pps)
+            self._sent_params = (sps, pps)
+        vcl = [x for x in nals if x[0] & 0x1F in (1, 5)]
+        if vcl and self._sent_params:
+            idr = any(x[0] & 0x1F == 5 for x in vcl)
+            self.send_frame(b"".join(len(x).to_bytes(4, "big") + x for x in vcl), idr)
+            if self._next_heartbeat is None:
+                self._next_heartbeat = time.monotonic() + 1
+        if self._next_heartbeat and time.monotonic() >= self._next_heartbeat:
+            self.send_heartbeat()
+            self._next_heartbeat += 1
+
+    def _progress(self, started, extra=""):
+        log.info("    t=%4.1fs frames=%d idr=%d sent=%.1f MB%s", time.monotonic() - started,
+                 self.stats["video_frames"], self.stats["idr_frames"], self.stats["bytes_sent"] / 1e6, extra)
+
+    def run(self, seconds, source=None):
         self._stop = threading.Event()
-        reader = threading.Thread(target=self._drain_receiver, daemon=True)
-        reader.start()
-        sent_params, encode_ms = None, []
+        self._sent_params, self._next_heartbeat = None, None
+        threading.Thread(target=self._drain_receiver, daemon=True).start()
         started = time.monotonic()
-        next_heartbeat = None
-        n = 0
+        encode_ms = []
         try:
-            while time.monotonic() - started < seconds and not self.stats["receiver_closed"]:
-                due = started + n / self.fps
-                delay = due - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                t0 = time.monotonic()
-                frame = self.av.VideoFrame.from_image(pattern.frame(n, self.fps)).reformat(format="yuv420p")
-                frame.pts = n
-                packets = self.encoder.encode(frame)
-                encode_ms.append((time.monotonic() - t0) * 1000)
-                for packet in packets:
-                    nals = split_annexb(bytes(packet))
-                    sps = next((x for x in nals if x[0] & 0x1F == 7), None)
-                    pps = next((x for x in nals if x[0] & 0x1F == 8), None)
-                    if sps and pps and (sps, pps) != sent_params:
-                        self.send_codec(sps, pps)
-                        sent_params = (sps, pps)
-                    vcl = [x for x in nals if x[0] & 0x1F in (1, 5)]
-                    if vcl and sent_params:
-                        idr = any(x[0] & 0x1F == 5 for x in vcl)
-                        self.send_frame(b"".join(len(x).to_bytes(4, "big") + x for x in vcl), idr)
-                        if next_heartbeat is None:
-                            next_heartbeat = time.monotonic() + 1
-                if next_heartbeat and time.monotonic() >= next_heartbeat:
-                    self.send_heartbeat()
-                    next_heartbeat += 1
-                if n % self.fps == 0:
-                    log.info("    t=%4.1fs frames=%d idr=%d sent=%.1f MB encode=%.0f ms/frame",
-                             time.monotonic() - started, self.stats["video_frames"], self.stats["idr_frames"],
-                             self.stats["bytes_sent"] / 1e6, sum(encode_ms[-self.fps:]) / len(encode_ms[-self.fps:]))
-                n += 1
+            if source is None:
+                pattern = TestPattern(self.width, self.height)
+                n = 0
+                while time.monotonic() - started < seconds and not self.stats["receiver_closed"]:
+                    delay = started + n / self.fps - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    t0 = time.monotonic()
+                    frame = self.av.VideoFrame.from_image(pattern.frame(n, self.fps)).reformat(format="yuv420p")
+                    frame.pts = n
+                    packets = self.encoder.encode(frame)
+                    encode_ms.append((time.monotonic() - t0) * 1000)
+                    for packet in packets:
+                        self._forward(bytes(packet))
+                    if n % self.fps == 0:
+                        self._progress(started, " encode=%.0f ms/frame" % (sum(encode_ms[-self.fps:]) / len(encode_ms[-self.fps:])))
+                    n += 1
+            else:
+                last_report = started
+                for annexb in source.packets():
+                    if time.monotonic() - started >= seconds or self.stats["receiver_closed"]:
+                        break
+                    self._forward(annexb)
+                    if time.monotonic() - last_report >= 1:
+                        last_report = time.monotonic()
+                        self._progress(started)
         except OSError as exc:
             self.stats["write_error"] = str(exc)
             log.info("    data channel write failed: %s", exc)
         finally:
             self._stop.set()
+            if source is not None:
+                source.stop()
         elapsed = time.monotonic() - started
         self.stats["seconds"] = round(elapsed, 2)
         self.stats["effective_fps"] = round(self.stats["video_frames"] / elapsed, 1) if elapsed else 0
         self.stats["encode_ms_avg"] = round(sum(encode_ms) / len(encode_ms), 1) if encode_ms else None
         return self.stats
+
+
+def monitor_size(name):
+    out = subprocess.run(["gpu-screen-recorder", "--list-capture-options"], capture_output=True,
+                         text=True, timeout=10).stdout
+    for line in out.splitlines():
+        parts = line.split("|")
+        if parts[0] == name and len(parts) > 1 and "x" in parts[1]:
+            w, h = parts[1].split("x")
+            return int(w), int(h)
+    raise ProbeError(f"monitor {name!r} not in gpu-screen-recorder capture options: {out.split()}")
+
+
+class ScreenSource:
+    """gpu-screen-recorder -> raw H.264 on a pipe -> access units (Annex B).
+
+    Raw H.264 rather than MPEG-TS: gpu-screen-recorder emits frames at a steady
+    33 ms either way, but demuxing TS through PyAV buffered them into bursts.
+    An access unit is complete when the next one begins, which costs one frame
+    of latency -- acceptable for a probe; the daemon gets boundaries from its
+    own encoder.
+    """
+
+    def __init__(self, monitor, fps, bitrate, encoder, log_path):
+        self.cmd = ["gpu-screen-recorder", "-w", monitor, "-c", "h264", "-k", "h264",
+                    "-f", str(fps), "-fm", "cfr", "-cursor", "yes", "-keyint", "1",
+                    "-tune", "performance", "-encoder", encoder, "-fallback-cpu-encoding", "yes",
+                    "-bm", "cbr", "-q", str(bitrate // 1000),
+                    # Without this the encoder keeps SPS/PPS in container extradata,
+                    # which the raw h264 muxer drops; clearing it puts them in-band.
+                    "-ffmpeg-video-opts", "flags=-global_header",
+                    "-o", "/dev/stdout"]
+        self.log_file = open(log_path, "wb")
+        self.proc = None
+        self.first_packet_ms = None
+
+    def packets(self):
+        started = time.monotonic()
+        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=self.log_file)
+        fd = self.proc.stdout.fileno()
+        buf, unit, unit_has_vcl = b"", [], False
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                return
+            buf += chunk
+            # Every NAL except the last is complete: it is followed by another start code.
+            starts, i = [], 0
+            while (i := buf.find(b"\x00\x00\x01", i)) >= 0:
+                starts.append(i)
+                i += 3
+            if len(starts) < 2:
+                continue
+            for a, b in zip(starts, starts[1:]):
+                nal = buf[a + 3:b]
+                if nal.endswith(b"\x00"):
+                    nal = nal[:-1]
+                if not nal:
+                    continue
+                kind = nal[0] & 0x1F
+                starts_new_unit = (kind in (1, 5) and len(nal) > 1 and nal[1] & 0x80) or kind in (6, 7, 8, 9)
+                if starts_new_unit and unit_has_vcl:
+                    if self.first_packet_ms is None:
+                        self.first_packet_ms = round((time.monotonic() - started) * 1000)
+                        log.info("    first captured frame after %d ms", self.first_packet_ms)
+                    yield b"".join(b"\x00\x00\x00\x01" + n for n in unit)
+                    unit, unit_has_vcl = [], False
+                unit.append(nal)
+                unit_has_vcl = unit_has_vcl or kind in (1, 5)
+            buf = buf[starts[-1]:]
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(2)  # SIGINT lets gpu-screen-recorder shut down cleanly
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.log_file.close()
 
 
 class FeedbackLoop(threading.Thread):
@@ -929,13 +1028,23 @@ def run(args):
                 data_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 steps["data_port_connect"] = f"ok ({data_port})"
                 if args.stream_seconds > 0:
-                    width, height = (int(v) for v in args.size.lower().split("x"))
-                    log.info("[5] Streaming %dx%d@%d test pattern for %ss (cipher=%s) -- watch the TV",
-                             width, height, args.fps, args.stream_seconds, args.video_cipher)
+                    source = None
+                    if args.source == "screen":
+                        width, height = monitor_size(args.monitor)
+                        source = ScreenSource(args.monitor, args.fps, args.bitrate, args.capture_encoder,
+                                              run_dir / "gpu-screen-recorder.log")
+                        label = f"screen {args.monitor}"
+                    else:
+                        width, height = (int(v) for v in args.size.lower().split("x"))
+                        label = "test pattern"
+                    log.info("[5] Streaming %s %dx%d@%d for %ss (cipher=%s) -- watch the TV",
+                             label, width, height, args.fps, args.stream_seconds, args.video_cipher)
                     streamer = MirrorStreamer(data_sock, args.video_cipher, shared, video_sc_id,
                                               write_key[:16], read_key[:16], width, height, args.fps,
                                               args.bitrate, lead=0.075)
-                    steps["stream"] = streamer.run(args.stream_seconds)
+                    steps["stream"] = streamer.run(args.stream_seconds, source)
+                    if source is not None:
+                        steps["stream"]["first_captured_frame_ms"] = source.first_packet_ms
                     log.info("    stream: %s", json.dumps(steps["stream"]))
                 else:
                     log.info("    connected to video data port %s; holding %ss -- watch the TV", data_port, args.hold)
@@ -983,6 +1092,10 @@ def main():
     parser.add_argument("--no-audio-retry", action="store_true")
     parser.add_argument("--stream-seconds", type=float, default=0, help="stage 2: stream a test pattern")
     parser.add_argument("--video-cipher", choices=["chacha", "aesctr", "none"], default="chacha")
+    parser.add_argument("--source", choices=["pattern", "screen"], default="pattern")
+    parser.add_argument("--monitor", default="eDP-1", help="monitor for --source screen")
+    parser.add_argument("--capture-encoder", choices=["gpu", "cpu"], default="cpu",
+                        help="gpu needs a working VA-API driver (intel-media-driver)")
     parser.add_argument("--size", default="1920x1080")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--bitrate", type=int, default=6_000_000)
