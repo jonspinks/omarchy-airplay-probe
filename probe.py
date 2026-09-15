@@ -59,6 +59,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from srptools import SRPClientSession, SRPContext, constants
+import numpy as np
 
 HERE = Path(__file__).resolve().parent
 AIRPLAY_PORT = 7000
@@ -497,6 +498,114 @@ class EventChannel(threading.Thread):
                 self.conn.sock.sendall(self.conn.cipher.seal(reply))
         except (ProbeError, OSError, ValueError) as exc:
             log.info("  [event] channel ended: %s", exc)
+
+
+# --------------------------------------------------------------------------- audio
+
+ALAC_SPF = 352
+AUDIO_RATE = 44100
+AUDIO_LATENCY_SAMPLES = int(0.085 * AUDIO_RATE)
+
+
+def alac_uncompressed_frame(pcm):
+    """Wrap 352 stereo s16le samples in an uncompressed ("escape") ALAC frame.
+
+    Header: channel tag 1 (stereo pair, 3 bits), instance 0 (4), 12 unused bits,
+    has-size 0, 2 unused, not-compressed 1; then big-endian samples; end tag 7.
+    """
+    samples = np.frombuffer(pcm, dtype="<i2").astype(">i2").tobytes()
+    bits = bytearray((23 + len(samples) * 8 + 3 + 7) // 8)
+    # header bits: 001 0000 000000000000 0 00 1  -> first 23 bits
+    header = (1 << 20) | 1
+    for i in range(23):
+        if header >> (22 - i) & 1:
+            bits[i // 8] |= 0x80 >> (i % 8)
+    # samples start at bit 23, i.e. shifted by 7 bits within the byte stream
+    value = int.from_bytes(samples, "big")
+    total_bits = len(samples) * 8
+    body = (value << 3 | 0b111)  # samples followed by end tag 7
+    body_bits = total_bits + 3
+    pad = (len(bits) * 8) - 23 - body_bits
+    body <<= pad
+    body_bytes = body.to_bytes((body_bits + pad + 7) // 8, "big")
+    # merge: first byte of body overlaps bit 23 (byte 2, bit 7)
+    out = int.from_bytes(bits, "big") | int.from_bytes(body_bytes, "big")
+    return out.to_bytes(len(bits), "big")
+
+
+class AudioSender(threading.Thread):
+    """Encrypted ALAC RTP to the receiver plus once-a-second NTP TimeAnnounce."""
+
+    def __init__(self, host, data_port, control_port, data_sock, ctrl_sock, key, mode):
+        super().__init__(daemon=True)
+        self.host, self.data_port, self.control_port = host, data_port, control_port
+        self.data_sock, self.ctrl_sock, self.mode = data_sock, ctrl_sock, mode
+        self.aead = ChaCha20Poly1305(key)
+        self.stop = threading.Event()
+        self.stats = {"packets": 0, "syncs": 0, "control_packets_from_receiver": 0, "source": mode}
+
+    def _sync(self, rtp_now, first):
+        packet = (bytes([0x90 if first else 0x80, 0xD4]) + (4).to_bytes(2, "big")
+                  + ((rtp_now - AUDIO_LATENCY_SAMPLES) & 0xFFFFFFFF).to_bytes(4, "big")
+                  + boot_ntp_timestamp().to_bytes(8, "big") + rtp_now.to_bytes(4, "big"))
+        self.ctrl_sock.sendto(packet, (self.host, self.control_port))
+        self.stats["syncs"] += 1
+
+    def _frames(self):
+        chunk = ALAC_SPF * 4
+        if self.mode == "tone":
+            t = 0
+            while not self.stop.is_set():
+                n = np.arange(t, t + ALAC_SPF)
+                phase = (n % AUDIO_RATE) / AUDIO_RATE
+                beep = (phase < 0.15).astype(np.float64)  # 150 ms beep each second
+                wave = 0.3 * np.sin(2 * np.pi * 880 * n / AUDIO_RATE) * beep
+                stereo = np.repeat((wave * 32767).astype("<i2"), 2)
+                t += ALAC_SPF
+                yield stereo.tobytes()
+        else:
+            proc = subprocess.Popen(["parec", "-d", "@DEFAULT_MONITOR@", "--raw", "--format=s16le",
+                                     f"--rate={AUDIO_RATE}", "--channels=2", "--latency-msec=10"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                buf = b""
+                while not self.stop.is_set():
+                    data = proc.stdout.read(chunk - len(buf))
+                    if not data:
+                        return
+                    buf += data
+                    if len(buf) == chunk:
+                        yield buf
+                        buf = b""
+            finally:
+                proc.terminate()
+
+    def run(self):
+        seq, rtp, nonce = random.getrandbits(16), random.getrandbits(32), 0
+        self.ctrl_sock.setblocking(False)
+        started, frame_index, last_sync = time.monotonic(), 0, 0.0
+        self._sync(rtp, first=True)
+        for pcm in self._frames():
+            if self.stop.is_set():
+                break
+            if self.mode == "tone":
+                delay = started + frame_index * ALAC_SPF / AUDIO_RATE - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+            header = bytes([0x80, 0x60]) + seq.to_bytes(2, "big") + rtp.to_bytes(4, "big") + (0).to_bytes(4, "big")
+            sealed = self.aead.encrypt(nonce_counter(nonce), alac_uncompressed_frame(pcm), header[4:12])
+            self.data_sock.sendto(header + sealed + nonce.to_bytes(8, "little"), (self.host, self.data_port))
+            nonce, seq, rtp, frame_index = nonce + 1, (seq + 1) & 0xFFFF, (rtp + ALAC_SPF) & 0xFFFFFFFF, frame_index + 1
+            self.stats["packets"] += 1
+            now = time.monotonic()
+            if now - last_sync >= 1.0:
+                self._sync(rtp, first=False)
+                last_sync = now
+            try:
+                while self.ctrl_sock.recv(2048):
+                    self.stats["control_packets_from_receiver"] += 1
+            except (BlockingIOError, OSError):
+                pass
 
 
 # --------------------------------------------------------------------------- stage 2: video
@@ -1147,6 +1256,28 @@ def run(args):
                                          "RTP-Info": "seq=0;rtptime=0"})
             steps["record"] = status
 
+        audio_ports = None
+        if args.audio != "none":
+            log.info("[3b] Audio stream SETUP (type 96, ALAC 44.1 kHz stereo, %s)", args.audio)
+            audio_key = os.urandom(32)
+            audio_desc = {
+                "type": 96, "streamConnectionID": audio_sc_id, "ct": 2, "spf": ALAC_SPF, "sr": AUDIO_RATE,
+                "audioFormat": 0x40000, "audioMode": "default", "usingScreen": True,
+                "latencyMin": 0, "latencyMax": AUDIO_LATENCY_SAMPLES,
+                "controlPort": args.timing_port + 1, "shk": audio_key,
+            }
+            astatus, _, abody = conn.request(
+                "SETUP", audio_uri, {}, plistlib.dumps({"streams": [audio_desc]}, fmt=plistlib.FMT_BINARY),
+                "application/x-apple-binary-plist", timeout=args.setup_timeout)
+            aresp = decode_plist(abody)
+            steps["audio_setup"] = {"status": astatus, "response": plist_summary(aresp)}
+            log.info("    response: %s", json.dumps(plist_summary(aresp), default=str)[:300])
+            stream96 = next((st for st in (aresp.get("streams") or []) if st.get("type") == 96), {}) if isinstance(aresp, dict) else {}
+            if astatus == 200 and stream96.get("dataPort"):
+                audio_ports = (int(stream96["dataPort"]), int(stream96.get("controlPort") or 0))
+                for _ in range(2):  # doubletake sends volume twice
+                    conn.request("SET_PARAMETER", audio_uri, {}, b"volume: 0.000000\r\n", "text/parameters")
+
         # 4. Video stream SETUP, no FairPlay ------------------------------
         def video_setup():
             video_sc_id = random.getrandbits(63)
@@ -1167,7 +1298,7 @@ def run(args):
         steps["video_setup"] = {"status": status, "response": plist_summary(vresp)}
         log.info("    response: %s", json.dumps(plist_summary(vresp), default=str)[:800])
 
-        if status != 200 and not args.no_audio_retry:
+        if status != 200 and not args.no_audio_retry and args.audio == "none":
             log.info("[4b] Video rejected alone; adding screen audio stream (type 96, ALAC) first")
             audio = {
                 "type": 96, "streamConnectionID": audio_sc_id, "ct": 2, "spf": 352, "sr": 44100,
@@ -1228,10 +1359,25 @@ def run(args):
                         label = "test pattern"
                     log.info("[5] Streaming %s %dx%d@%d for %ss (cipher=%s) -- watch the TV",
                              label, width, height, args.fps, args.stream_seconds, args.video_cipher)
+                    audio = None
+                    if audio_ports:
+                        ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        ctrl_sock.bind(("0.0.0.0", args.timing_port + 1))
+                        adata_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        adata_sock.bind(("0.0.0.0", args.timing_port + 2))
+                        audio = AudioSender(host, audio_ports[0], audio_ports[1], adata_sock, ctrl_sock, audio_key, args.audio)
+                        audio.start()
+                        log.info("    audio started -> dataPort %d controlPort %d", *audio_ports)
+                        cleanups.insert(0, lambda: (audio.stop.set(), audio.join(3), ctrl_sock.close(), adata_sock.close()))
                     streamer = MirrorStreamer(data_sock, args.video_cipher, shared, video_sc_id,
                                               write_key[:16], read_key[:16], width, height, args.fps,
                                               args.bitrate, lead=0.075)
                     steps["stream"] = streamer.run(args.stream_seconds, source)
+                    if audio:
+                        audio.stop.set()
+                        audio.join(3)
+                        steps["audio"] = audio.stats
+                        log.info("    audio: %s", json.dumps(audio.stats))
                     if source is not None:
                         steps["stream"]["first_captured_frame_ms"] = source.first_packet_ms
                         if hasattr(source, "captured"):
@@ -1286,6 +1432,8 @@ def main():
     parser.add_argument("--setup-timeout", type=float, default=10)
     parser.add_argument("--hold", type=float, default=5)
     parser.add_argument("--no-audio-retry", action="store_true")
+    parser.add_argument("--audio", choices=["none", "tone", "system"], default="none",
+                        help="tone: 880 Hz beep each second; system: default sink monitor via parec")
     parser.add_argument("--stream-seconds", type=float, default=0, help="stage 2: stream a test pattern")
     parser.add_argument("--video-cipher", choices=["chacha", "aesctr", "none"], default="chacha")
     parser.add_argument("--source", choices=["pattern", "screen", "portal", "wayland"], default="pattern")
