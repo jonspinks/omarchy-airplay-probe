@@ -665,6 +665,8 @@ class MirrorStreamer:
         sps = next((x for x in nals if x[0] & 0x1F == 7), None)
         pps = next((x for x in nals if x[0] & 0x1F == 8), None)
         if sps and pps and (sps, pps) != self._sent_params:
+            if self._source is not None and getattr(self._source, "size", None):
+                self.width, self.height = self._source.size
             self.send_codec(sps, pps)
             self._sent_params = (sps, pps)
         vcl = [x for x in nals if x[0] & 0x1F in (1, 5)]
@@ -683,6 +685,7 @@ class MirrorStreamer:
 
     def run(self, seconds, source=None):
         self._stop = threading.Event()
+        self._source = source
         self._sent_params, self._next_heartbeat = None, None
         threading.Thread(target=self._drain_receiver, daemon=True).start()
         started = time.monotonic()
@@ -749,14 +752,24 @@ class ScreenSource:
     own encoder.
     """
 
-    def __init__(self, monitor, fps, bitrate, encoder, log_path):
+    def __init__(self, monitor, fps, bitrate, encoder, log_path, fit_within, source_size):
+        # The receiver's H.264 decoder has a level ceiling (the Frame advertises
+        # avc1.64002a = High@4.2, max 8192 macroblocks). A 1920x1200 panel is 9000
+        # macroblocks, forcing level 5.0, which the Frame accepts and renders black.
+        # So scale to fit the receiver's display, preserving aspect ratio.
+        box_w, box_h = fit_within
+        scale = min(1.0, box_w / source_size[0], box_h / source_size[1])
+        self.size = (int(source_size[0] * scale) // 2 * 2, int(source_size[1] * scale) // 2 * 2)
         self.cmd = ["gpu-screen-recorder", "-w", monitor, "-c", "h264", "-k", "h264",
                     "-f", str(fps), "-fm", "cfr", "-cursor", "yes", "-keyint", "1",
                     "-tune", "performance", "-encoder", encoder, "-fallback-cpu-encoding", "yes",
-                    "-bm", "cbr", "-q", str(bitrate // 1000),
-                    # Without this the encoder keeps SPS/PPS in container extradata,
-                    # which the raw h264 muxer drops; clearing it puts them in-band.
-                    "-ffmpeg-video-opts", "flags=-global_header",
+                    "-bm", "cbr", "-q", str(bitrate // 1000), "-s", f"{box_w}x{box_h}",
+                    # flags=-global_header: otherwise SPS/PPS live in container extradata,
+                    #   which the raw h264 muxer drops.
+                    # tune=zerolatency: gpu-screen-recorder's default x264 setup uses 21
+                    #   frame threads plus a 10-frame lookahead, holding ~1 s of frames;
+                    #   first output drops from ~1300 ms to ~250 ms without it.
+                    "-ffmpeg-video-opts", "flags=-global_header;level=4.2;tune=zerolatency",
                     "-o", "/dev/stdout"]
         self.log_file = open(log_path, "wb")
         self.proc = None
@@ -790,12 +803,26 @@ class ScreenSource:
                 if starts_new_unit and unit_has_vcl:
                     if self.first_packet_ms is None:
                         self.first_packet_ms = round((time.monotonic() - started) * 1000)
-                        log.info("    first captured frame after %d ms", self.first_packet_ms)
+                        self._confirm_size(b"".join(b"\x00\x00\x00\x01" + n for n in unit))
+                        log.info("    first captured frame after %d ms (%dx%d)", self.first_packet_ms, *self.size)
                     yield b"".join(b"\x00\x00\x00\x01" + n for n in unit)
                     unit, unit_has_vcl = [], False
                 unit.append(nal)
                 unit_has_vcl = unit_has_vcl or kind in (1, 5)
             buf = buf[starts[-1]:]
+
+    def _confirm_size(self, access_unit):
+        """Decode the first frame so the codec packet declares the real encoded size."""
+        import av
+        try:
+            decoder = av.CodecContext.create("h264", "r")
+            frames = decoder.decode(av.Packet(access_unit))
+            if frames and (frames[0].width, frames[0].height) != self.size:
+                log.info("    encoder produced %dx%d, expected %dx%d; using actual",
+                         frames[0].width, frames[0].height, *self.size)
+                self.size = (frames[0].width, frames[0].height)
+        except Exception as exc:  # the size estimate still stands
+            log.info("    could not confirm encoded size: %s", exc)
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -1030,10 +1057,12 @@ def run(args):
                 if args.stream_seconds > 0:
                     source = None
                     if args.source == "screen":
-                        width, height = monitor_size(args.monitor)
+                        display = (info.get("displays") or [{}])[0]
+                        fit = (display.get("widthPixels") or 1920, display.get("heightPixels") or 1080)
                         source = ScreenSource(args.monitor, args.fps, args.bitrate, args.capture_encoder,
-                                              run_dir / "gpu-screen-recorder.log")
-                        label = f"screen {args.monitor}"
+                                              run_dir / "gpu-screen-recorder.log", fit, monitor_size(args.monitor))
+                        width, height = source.size
+                        label = f"screen {args.monitor} (fit {fit[0]}x{fit[1]})"
                     else:
                         width, height = (int(v) for v in args.size.lower().split("x"))
                         label = "test pattern"
