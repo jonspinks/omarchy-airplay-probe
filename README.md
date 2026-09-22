@@ -22,7 +22,7 @@ displays video from this probe with **no FairPlay**:
 
 ```sh
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python probe.py --name '^Office TV$' --stream-seconds 20
+.venv/bin/python probe.py --name '^Demo TV$' --stream-seconds 20
 ```
 
 `--host IP` skips mDNS discovery, which is unreliable across subnets.
