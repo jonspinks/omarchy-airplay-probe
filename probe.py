@@ -62,6 +62,27 @@ from srptools import SRPClientSession, SRPContext, constants
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
+
+
+def credentials_path() -> Path:
+    """Long-term pairing keys live outside the checkout, where a `git add .`
+    cannot pick them up: $XDG_CONFIG_HOME/airplay-probe/credentials.json.
+    A file left next to probe.py by an older version is moved there once."""
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    path = base / "airplay-probe" / "credentials.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    legacy = HERE / "credentials.json"
+    if legacy.exists() and not path.exists():
+        legacy.replace(path)
+    return path
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a secret so it is never readable by anyone else, not even briefly."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
 AIRPLAY_PORT = 7000
 USER_AGENT = "AirPlay/935.7.1"
 SOURCE_VERSION = "980.71.1"
@@ -1169,7 +1190,7 @@ def run(args):
     try:
         # 1. Pairing -------------------------------------------------------
         log.info("[1] Pairing (%s)", args.pairing)
-        creds_path = HERE / "credentials.json"
+        creds_path = credentials_path()
         attempts = []
         if args.pairing in ("auto", "transient"):
             attempts.append("transient")
@@ -1190,8 +1211,7 @@ def run(args):
                     else:
                         creds = pair_setup_pin(conn, args.hkp, args.pin_file, args.pin_timeout, step)
                         stored[host] = creds
-                        creds_path.write_text(json.dumps(stored, indent=1))
-                        creds_path.chmod(0o600)
+                        write_private(creds_path, json.dumps(stored, indent=1))
                         conn.close()
                         conn = RtspConnection(host, AIRPLAY_PORT)
                     shared = pair_verify(conn, creds, step)
@@ -1479,7 +1499,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--name", default="The Frame", help="regex matched against mDNS names")
+    parser.add_argument("--name", help="regex matched against mDNS names (required unless --host is given)")
     parser.add_argument("--host", help="skip discovery and use this IP")
     parser.add_argument("--pairing", choices=["auto", "transient", "pin"], default="auto")
     parser.add_argument("--hkp", type=int, choices=[HKP_PIN, HKP_SCREEN_CAPTURE], default=HKP_SCREEN_CAPTURE,
@@ -1517,6 +1537,8 @@ def main():
     parser.add_argument("--pin-file", type=Path, default=HERE / "pin")
     parser.add_argument("--pin-timeout", type=float, default=180)
     args = parser.parse_args()
+    if not args.host and not args.name:
+        parser.error("give --name REGEX (matched against mDNS names) or --host IP")
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     # SIGTERM (timeout, systemd) would otherwise skip `finally`, leaving a virtual output behind.

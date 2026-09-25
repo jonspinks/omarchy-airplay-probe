@@ -1,8 +1,9 @@
 # airplay-probe
 
-Throwaway investigation tool for a native AirPlay screen-mirroring sender for
-Omarchy. Not the product — the product will be a Rust daemon built from what
-this probe proves.
+The protocol notebook behind [omarchy-airplay](https://github.com/jonspinks/omarchy-airplay):
+a Python probe that worked out, against a real receiver, what a native AirPlay
+screen-mirroring sender for Linux has to do. The Rust sender is the product;
+this is where each step was first proven.
 
 ## Result (2026-09-15)
 
@@ -25,8 +26,19 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python probe.py --name '^Demo TV$' --stream-seconds 20
 ```
 
-`--host IP` skips mDNS discovery, which is unreliable across subnets.
+`--name` is a regex matched against the receivers' mDNS names; `--host IP`
+skips discovery, which is unreliable across subnets. One of the two is required.
 Each run writes `runs/<timestamp>/log.txt` and `report.json`.
+
+## Secrets
+
+- Long-term pairing keys are kept in `~/.config/airplay-probe/credentials.json`
+  (`$XDG_CONFIG_HOME` if set), mode 0600, outside the checkout. A
+  `credentials.json` left next to `probe.py` by an older version is moved
+  there on the next run.
+- `runs/` holds logs and reports with your receiver's identifiers (name,
+  device ID, addresses). It is gitignored; scrub it before sharing a run.
+- `pin` and `portal-session-token` are gitignored too.
 
 ## References
 
@@ -37,3 +49,7 @@ Protocol details were cross-checked against, not copied from:
   SETUP sequence, data-channel packet layout, Samsung timing quirk.
 
 Fetch copies into `ref/` when needed; they are not committed.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
